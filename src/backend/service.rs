@@ -1,78 +1,96 @@
-use actix_web::{web, App, HttpServer, HttpResponse, Responder};
-use serde::Deserialize;
-use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres, Row, Column};
-use std::{env, time::Duration};
+use actix_identity::{Identity, IdentityMiddleware};
+use actix_session::{config::PersistentSession, storage::CookieSessionStore, SessionMiddleware};
+use actix_web::{ cookie::{time::Duration, Cookie, Key, SameSite}, get, middleware::{self}, post, web::{self, route}, App, HttpMessage as _, HttpRequest, HttpResponse, HttpServer, Responder, Scope};
+use bb8::Pool;
+use bb8_tiberius::ConnectionManager;
 
-async fn connect_db(pool: web::Data<PgPool>) -> impl Responder {
-    match sqlx::query("SELECT 1").fetch_one(pool.get_ref()).await {
-        Ok(_) => HttpResponse::Ok().body("Connected"),
-        Err(_) => HttpResponse::InternalServerError().body("Connection Failed"),
-    }
+use crate::backend::{context::{connection::create_pool, jwt_session::create_jwt}, services::generic_services::{ActionResult, GenericService, LoginRequest, WebUser}};
+
+use super::services::generic_services;
+
+#[get("/")]
+async fn health_check() -> String {
+    format!("Snakesystem Report Designer")
 }
 
-#[derive(Deserialize)]
-struct RetrieveRequest {
-    // start_date: String,
-    // end_date: String,
-    // param1: i32,
-    // param2: i32,
-    // param3: i32,
-}
+#[post("/login")]
+async fn login(req: HttpRequest, pool: web::Data<Pool<ConnectionManager>>, request: web::Json<LoginRequest>) -> impl Responder {
 
-async fn retrieve_data(pool: web::Data<PgPool>, body: web::Json<RetrieveRequest>) -> impl Responder {
-    // let mut tx = match pool.begin().await {
-    //     Ok(tx) => tx,
-    //     Err(_) => return HttpResponse::InternalServerError().body("Failed to start transaction"),
-    // };
+    let result: ActionResult<WebUser, _> = GenericService::login(pool, request.into_inner()).await;
 
-    let call_query = "SELECT * FROM rpt_journal_voucher('2024-01-01 00:00:00', '2024-01-01 00:00:00', 1, 100, 200);";
-
-    // Eksekusi stored procedure dan ambil hasilnya
-    let result= sqlx::query(call_query)
-        .fetch_all(&**pool)
-        .await;
-
-    dbg!(&result);
     match result {
-        Ok(rows) => {
-            dbg!(&rows);
-            let columns: Vec<String> = if let Some(first_row) = rows.first() {
-                first_row.columns().iter().map(|col| col.name().to_string()).collect()
-            } else {
-                vec![] // Jika tidak ada data, tetap kembalikan array kosong
-            };
+        response if response.error.is_some() => {
+            HttpResponse::InternalServerError().json(response)
+        }, // Jika error, HTTP 500
+        response if response.result => {
+            if let Some(user) = &response.data {
+                // ✅ Buat token JWT
+                match create_jwt(user.clone()) {
+                    Ok(token) => {
+                        Identity::login(&req.extensions(), token.clone()).unwrap(); // ✅ Simpan sesi
 
-            HttpResponse::Ok().json(serde_json::json!({ "columns": columns, "data": [] }))
-        }
-        Err(_) => HttpResponse::InternalServerError().body("Failed to fetch data"),
+                        // ✅ Simpan token dalam cookie
+                        let cookie = Cookie::build("token", token.clone())
+                            .path("/")
+                            .http_only(true)
+                            .same_site(SameSite::Strict)
+                            .secure(false) // Ubah ke `true` jika pakai HTTPS
+                            .finish();
+
+                        return HttpResponse::Ok()
+                            .cookie(cookie)
+                            .json(response);
+                    }
+                    Err(err) => {
+                        return HttpResponse::InternalServerError().json(response);
+                    }
+                }
+            }
+
+            HttpResponse::BadRequest().json(response) // Jika tidak ada user, return 400
+        },
+        response => HttpResponse::BadRequest().json(response), // Jika gagal login, HTTP 400
     }
-
 }
 
-pub type DbPool = Pool<Postgres>;
-
-pub async fn connection_pool() -> Result<Pool<Postgres>, sqlx::Error> {
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    PgPoolOptions::new()
-        .max_connections(10)
-        .min_connections(5)
-        .acquire_timeout(Duration::from_secs(60))
-        .idle_timeout(Duration::from_secs(60))
-        .connect(&database_url).await
+fn web_scope() -> Scope {
+    
+    web::scope("/auth")
+        .service(login)
 }
 
 pub async fn start_server() -> std::io::Result<()> {
+    env_logger::init(); // Aktifkan logging
+    let secret_key: Key = Key::generate(); 
     dotenvy::dotenv().ok();
-    let pool: DbPool = connection_pool().await.unwrap();
-
+    let db_pool = create_pool("db12877").await.expect("Failed to create database pool");
+    
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(pool.clone()))
-            .route("/connect", web::get().to(connect_db))
-            .route("/retrieve", web::post().to(retrieve_data))
+            .service(web::scope("/services")
+            .service(web_scope())
+        )
+        .app_data(web::Data::new(db_pool.clone()))
+        .app_data(web::JsonConfig::default().error_handler(generic_services::GenericService::json_error_handler))
+        .service(health_check)
+        .default_service(route().to(generic_services::GenericService::not_found))
+        .wrap(middleware::Logger::default()) // Logging middleware
+        .wrap(IdentityMiddleware::default())
+        .wrap(
+            SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone())
+                .cookie_name("token".to_owned())
+                .cookie_secure(false)
+                .session_lifecycle(PersistentSession::default().session_ttl(Duration::days(7)))
+                .build(),
+        )
+        .wrap(middleware::NormalizePath::trim()) // 🔥 Normalisasi path (opsional)
+        .wrap(middleware::Logger::default())
     })
-    .bind("127.0.0.1:8000")?
+    .bind(("127.0.0.1", 8001))?
     .run()
     .await
+    .map_err(|e| {
+        eprintln!("Server error: {}", e);
+        e
+    })
 }
